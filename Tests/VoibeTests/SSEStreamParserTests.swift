@@ -37,6 +37,23 @@ final class SSEStreamParserTests: XCTestCase {
         XCTAssertEqual(events, [.done(nil)])
     }
 
+    func testParsesCRLFDelimiters() {
+        var parser = SSEStreamParser()
+        let data = "data: {\"type\":\"transcript.text.delta\",\"delta\":\"hi\"}\r\n\r\n".data(using: .utf8)!
+
+        let events = parser.feed(data)
+
+        XCTAssertEqual(events, [.delta("hi")])
+    }
+
+    func testFlushesTrailingEventWithoutDelimiter() {
+        var parser = SSEStreamParser()
+        let data = "data: {\"type\":\"transcript.text.delta\",\"delta\":\"trail\"}\n".data(using: .utf8)!
+
+        XCTAssertEqual(parser.feed(data), [])
+        XCTAssertEqual(parser.flush(), [.delta("trail")])
+    }
+
     func testIgnoresInvalidJSON() {
         var parser = SSEStreamParser()
         let data = "data: not-json\n\n".data(using: .utf8)!

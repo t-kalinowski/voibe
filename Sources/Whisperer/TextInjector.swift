@@ -16,24 +16,9 @@ class TextInjector {
     }
     
     private func injectTextOnQueue(_ text: String) {
-        // Handle delta updates vs. full text
-        let newText: String
-        
-        // Only inject new text (the part that hasn't been injected yet)
-        if text.hasPrefix(previousText) && !previousText.isEmpty {
-            // If we already injected some of this text, only inject the new part
-            newText = String(text.dropFirst(previousText.count))
-            // Update the previous text to include the new text
-            previousText = text
-        } else if text.count < previousText.count || !text.contains(previousText) {
-            // If text is shorter or doesn't contain previous text, it's likely a new utterance
-            newText = text
-            previousText = text
-        } else {
-            // Otherwise inject all of it
-            newText = text
-            previousText = text
-        }
+        let result = TextInjector.computeDelta(previousText: previousText, incomingText: text)
+        let newText = result.delta
+        previousText = result.newPreviousText
         
         // Do nothing if there's no new text
         guard !newText.isEmpty else { 
@@ -93,6 +78,20 @@ class TextInjector {
             self?.previousText = ""
         }
     }
+
+    static func computeDelta(previousText: String, incomingText: String) -> (delta: String, newPreviousText: String) {
+        // Only inject new text (the part that hasn't been injected yet)
+        if incomingText.hasPrefix(previousText) && !previousText.isEmpty {
+            let delta = String(incomingText.dropFirst(previousText.count))
+            return (delta, incomingText)
+        }
+        
+        if incomingText.count < previousText.count || !incomingText.contains(previousText) {
+            return (incomingText, incomingText)
+        }
+        
+        return (incomingText, incomingText)
+    }
     
     private func log(_ message: String) {
         if logEnabled {
@@ -103,4 +102,3 @@ class TextInjector {
         }
     }
 } 
-
