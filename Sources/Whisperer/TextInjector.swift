@@ -2,14 +2,20 @@ import Foundation
 import Cocoa
 import Carbon
 
-@MainActor
 class TextInjector {
+    private let injectionQueue = DispatchQueue(label: "com.voibe.textInjector")
     // Previous text to avoid reinserting the same content
     private var previousText = ""
     // For logging
     private let logEnabled = true
     
     func injectText(_ text: String) {
+        injectionQueue.async { [weak self] in
+            self?.injectTextOnQueue(text)
+        }
+    }
+    
+    private func injectTextOnQueue(_ text: String) {
         // Handle delta updates vs. full text
         let newText: String
         
@@ -83,7 +89,9 @@ class TextInjector {
     }
     
     func reset() {
-        previousText = ""
+        injectionQueue.async { [weak self] in
+            self?.previousText = ""
+        }
     }
     
     private func log(_ message: String) {
@@ -95,5 +103,4 @@ class TextInjector {
         }
     }
 } 
-
 

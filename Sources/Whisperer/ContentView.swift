@@ -102,33 +102,14 @@ struct ContentView: View {
         .frame(width: 320)
         .onAppear {
             validateApiKey(apiKey)
-            setupNotifications()
         }
-        .onDisappear {
-            removeNotifications()
-        }
-    }
-    
-    private func setupNotifications() {
-        // Subscribe to transcription completed notifications
-        NotificationCenter.default.addObserver(
-            forName: .transcriptionCompleted,
-            object: nil,
-            queue: .main
-        ) { notification in
-            // Update metrics with the duration from notification
+        .onReceive(NotificationCenter.default.publisher(for: .transcriptionCompleted)) { notification in
             if let duration = notification.userInfo?["duration"] as? Double {
                 updateMetrics(duration: duration)
             } else {
-                // If duration is missing for some reason, just increment count
-                // with a minimal duration to ensure it's counted
                 updateMetrics(duration: 0.1)
             }
         }
-    }
-    
-    private func removeNotifications() {
-        NotificationCenter.default.removeObserver(self, name: .transcriptionCompleted, object: nil)
     }
     
     private func validateApiKey(_ key: String) {

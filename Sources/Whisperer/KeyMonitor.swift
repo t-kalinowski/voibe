@@ -41,7 +41,7 @@ class KeyMonitor {
             options: .defaultTap,
             eventsOfInterest: CGEventMask(eventMask),
             callback: eventTapCallback,
-            userInfo: Unmanaged.passRetained(self).toOpaque()
+            userInfo: Unmanaged.passUnretained(self).toOpaque()
         ) else {
             log("Failed to create event tap")
             return

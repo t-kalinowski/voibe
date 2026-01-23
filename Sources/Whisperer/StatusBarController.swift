@@ -488,7 +488,11 @@ class StatusBarController: ObservableObject {
     
     private func playSound(_ sound: NSSound?, customSound: NSSound?) {
         // Try to play custom sound first, fall back to system sound
-        customSound?.play() ?? sound?.play()
+        if let customSound = customSound {
+            customSound.play()
+        } else {
+            sound?.play()
+        }
     }
     
     deinit {
@@ -514,8 +518,8 @@ class StatusBarController: ObservableObject {
                 await transcriptionService.cancelTranscription()
             }
             
-            // Stop recording (requires await since it's actor-isolated)
-            await ar.stopRecording()
+            // Stop recording
+            ar.stopRecording()
         }
     }
 } 
