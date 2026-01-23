@@ -2,32 +2,23 @@ import Foundation
 import Cocoa
 import Carbon
 
-@MainActor
 class TextInjector {
+    private let injectionQueue = DispatchQueue(label: "com.voibe.textInjector")
     // Previous text to avoid reinserting the same content
     private var previousText = ""
     // For logging
     private let logEnabled = true
     
     func injectText(_ text: String) {
-        // Handle delta updates vs. full text
-        let newText: String
-        
-        // Only inject new text (the part that hasn't been injected yet)
-        if text.hasPrefix(previousText) && !previousText.isEmpty {
-            // If we already injected some of this text, only inject the new part
-            newText = String(text.dropFirst(previousText.count))
-            // Update the previous text to include the new text
-            previousText = text
-        } else if text.count < previousText.count || !text.contains(previousText) {
-            // If text is shorter or doesn't contain previous text, it's likely a new utterance
-            newText = text
-            previousText = text
-        } else {
-            // Otherwise inject all of it
-            newText = text
-            previousText = text
+        injectionQueue.async { [weak self] in
+            self?.injectTextOnQueue(text)
         }
+    }
+    
+    private func injectTextOnQueue(_ text: String) {
+        let result = TextInjector.computeDelta(previousText: previousText, incomingText: text)
+        let newText = result.delta
+        previousText = result.newPreviousText
         
         // Do nothing if there's no new text
         guard !newText.isEmpty else { 
@@ -83,7 +74,23 @@ class TextInjector {
     }
     
     func reset() {
-        previousText = ""
+        injectionQueue.async { [weak self] in
+            self?.previousText = ""
+        }
+    }
+
+    static func computeDelta(previousText: String, incomingText: String) -> (delta: String, newPreviousText: String) {
+        // Only inject new text (the part that hasn't been injected yet)
+        if incomingText.hasPrefix(previousText) && !previousText.isEmpty {
+            let delta = String(incomingText.dropFirst(previousText.count))
+            return (delta, incomingText)
+        }
+        
+        if incomingText.count < previousText.count || !incomingText.contains(previousText) {
+            return (incomingText, incomingText)
+        }
+        
+        return (incomingText, incomingText)
     }
     
     private func log(_ message: String) {
@@ -95,5 +102,3 @@ class TextInjector {
         }
     }
 } 
-
-

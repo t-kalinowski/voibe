@@ -51,7 +51,10 @@ actor TranscriptionService {
     }
     
     private var recordedAudioData: Data?
-    private var transcriptionTask: URLSessionDataTask?
+    private var transcriptionTask: Task<Void, Never>?
+    private var sseParser = SSEStreamParser()
+    private var didComplete = false
+    private var didReceiveText = false
     
     // Callbacks
     private var onTranscriptionReceived: ((String) -> Void)?
@@ -145,76 +148,94 @@ actor TranscriptionService {
         
         // Cancel any existing task
         transcriptionTask?.cancel()
+        transcriptionTask = nil
+        sseParser = SSEStreamParser()
+        didComplete = false
+        didReceiveText = false
         
         log(.info, message: "Sending audio for transcription...")
         
-        // Capture weak self before creating URLSession task
-        let weakSelf = self
-        
-        // Create a data task for the request with streaming support
-        let session = URLSession.shared
-        transcriptionTask = session.dataTask(with: request) { data, response, error in
-            Task {
-                // Re-obtain self inside the task to ensure actor isolation
-                await weakSelf.handleTranscriptionResponse(data: data, response: response, error: error)
-            }
+        transcriptionTask = Task { [weak self] in
+            await self?.streamTranscription(request: request)
         }
-        
-        transcriptionTask?.resume()
     }
     
-    // Handle the transcription response in actor-isolated context
-    private func handleTranscriptionResponse(data: Data?, response: URLResponse?, error: Error?) {
-        if let error = error {
-            log(.error, message: "Transcription request failed: \(error.localizedDescription)")
+    private func streamTranscription(request: URLRequest) async {
+        do {
+            let (bytes, response) = try await URLSession.shared.bytes(for: request)
             
-            // Check if this is a cancellation - don't retry in that case
-            if (error as NSError).domain == NSURLErrorDomain && 
-               (error as NSError).code == NSURLErrorCancelled {
+            guard let httpResponse = response as? HTTPURLResponse else {
+                connectionState = .error("Invalid response from server")
+                return
+            }
+            
+            if httpResponse.statusCode != 200 {
+                let errorData = try await collectBytes(bytes)
+                let errorMessage = parseErrorMessage(data: errorData)
+                log(.error, message: "Server returned error: \(httpResponse.statusCode), \(errorMessage)")
+                
+                // Check if this is a server error (5xx) that should be retried
+                if httpResponse.statusCode >= 500 && httpResponse.statusCode < 600 {
+                    retryTranscriptionIfPossible(with: "Server error: \(httpResponse.statusCode)")
+                    return
+                }
+                
+                connectionState = .error("Server error: \(httpResponse.statusCode)")
+                return
+            }
+            
+            var chunk = Data()
+            var responseData = Data()
+            for try await byte in bytes {
+                if Task.isCancelled {
+                    connectionState = .error("Request cancelled")
+                    return
+                }
+                
+                chunk.append(byte)
+                responseData.append(byte)
+                if chunk.count >= 1024 {
+                    handleSSEChunk(&chunk)
+                }
+            }
+            
+            if !chunk.isEmpty {
+                handleSSEChunk(&chunk)
+            }
+            
+            let trailingEvents = sseParser.flush()
+            if !trailingEvents.isEmpty {
+                handleSSEEvents(trailingEvents)
+            }
+
+            // Reset retry count on success
+            currentRetryCount = 0
+            
+            if !didReceiveText, let showingText = parseTranscriptionText(data: responseData) {
+                didReceiveText = true
+                Task { @MainActor in
+                    await self.onTranscriptionReceived?(showingText)
+                }
+            }
+            
+            log(.info, message: "Transcription complete")
+            connectionState = .idle
+            
+            if !didComplete {
+                didComplete = true
+                Task { @MainActor in
+                    await self.onTranscriptionComplete?()
+                }
+            }
+        } catch {
+            if Task.isCancelled {
                 connectionState = .error("Request cancelled")
                 return
             }
             
+            log(.error, message: "Transcription request failed: \(error.localizedDescription)")
             retryTranscriptionIfPossible(with: "Request failed: \(error.localizedDescription)")
-            return
         }
-        
-        guard let httpResponse = response as? HTTPURLResponse else {
-            connectionState = .error("Invalid response from server")
-            return
-        }
-        
-        if httpResponse.statusCode != 200 {
-            let errorMessage = parseErrorMessage(data: data)
-            log(.error, message: "Server returned error: \(httpResponse.statusCode), \(errorMessage)")
-            
-            // Check if this is a server error (5xx) that should be retried
-            if httpResponse.statusCode >= 500 && httpResponse.statusCode < 600 {
-                retryTranscriptionIfPossible(with: "Server error: \(httpResponse.statusCode)")
-                return
-            }
-            
-            // For other errors, don't retry
-            connectionState = .error("Server error: \(httpResponse.statusCode)")
-            return
-        }
-        
-        // Reset retry count on success
-        currentRetryCount = 0
-        
-        guard let data = data else {
-            connectionState = .error("No data received")
-            return
-        }
-        
-        log(.info, message: "Transcription data received, processing SSE response")
-        
-        // Process the SSE data
-        handleSSEData(data)
-        
-        // Mark as complete
-        log(.info, message: "Transcription complete")
-        connectionState = .idle
     }
     
     // New function to handle retries with exponential backoff
@@ -298,125 +319,44 @@ actor TranscriptionService {
     
     // Function to create a WAV file from the PCM audio data
     private func createWavFileFromPCMData(_ pcmData: Data) -> Data {
-        // Standard WAV header for 16-bit PCM, mono, 16kHz
-        var header = Data()
-        
-        // "RIFF" chunk descriptor
-        header.append("RIFF".data(using: .ascii)!)
-        
-        // ChunkSize: 4 + (8 + 16) + (8 + PCM data size)
-        let fileSize = 36 + pcmData.count
-        header.append(UInt32(fileSize).littleEndian.data)
-        
-        // Format: "WAVE"
-        header.append("WAVE".data(using: .ascii)!)
-        
-        // "fmt " sub-chunk
-        header.append("fmt ".data(using: .ascii)!)
-        header.append(UInt32(16).littleEndian.data) // Sub-chunk size (16 for PCM)
-        header.append(UInt16(1).littleEndian.data)  // AudioFormat (1 for PCM)
-        header.append(UInt16(1).littleEndian.data)  // NumChannels (1 for mono)
-        header.append(UInt32(16000).littleEndian.data) // SampleRate (16kHz)
-        
-        // ByteRate = SampleRate * NumChannels * (BitsPerSample / 8)
-        header.append(UInt32(16000 * 1 * 2).littleEndian.data)
-        
-        // BlockAlign = NumChannels * (BitsPerSample / 8)
-        header.append(UInt16(1 * 2).littleEndian.data)
-        
-        // BitsPerSample (16 bits)
-        header.append(UInt16(16).littleEndian.data)
-        
-        // "data" sub-chunk
-        header.append("data".data(using: .ascii)!)
-        header.append(UInt32(pcmData.count).littleEndian.data) // Sub-chunk size (raw PCM data size)
-        
-        // Combine header with PCM data
-        var wavData = Data()
-        wavData.append(header)
-        wavData.append(pcmData)
-        
-        return wavData
+        WavEncoder.encodePCM(pcmData)
     }
     
-    // Process SSE data
-    private func handleSSEData(_ data: Data) {
-        guard let sseText = String(data: data, encoding: .utf8) else {
-            log(.error, message: "Failed to decode SSE data")
-            // Ensure we still complete the transcription even on error
-            Task { @MainActor in
-                await self.onTranscriptionComplete?()
-            }
-            return
-        }
-        
-        // Split the string by double newlines, which separate SSE messages
-        let eventStrings = sseText.components(separatedBy: "\n\n")
-        
-        // Track if we got any valid deltas
-        var receivedAnyDeltas = false
-        
-        for eventString in eventStrings {
-            if eventString.isEmpty { continue }
-            
-            // Extract the JSON from lines that start with "data: "
-            for line in eventString.components(separatedBy: "\n") {
-                if line.hasPrefix("data: ") {
-                    let jsonText = String(line.dropFirst(6))
-                    receivedAnyDeltas = processSSEEvent(jsonText) || receivedAnyDeltas
+    private func handleSSEChunk(_ chunk: inout Data) {
+        let events = sseParser.feed(chunk)
+        chunk.removeAll(keepingCapacity: true)
+        handleSSEEvents(events)
+    }
+    
+    private func handleSSEEvents(_ events: [SSEEvent]) {
+        for event in events {
+            switch event {
+            case .delta(let delta):
+                log(.debug, message: "Transcription delta: \"\(delta)\"")
+                didReceiveText = true
+                Task { @MainActor in
+                    await self.onTranscriptionReceived?(delta)
                 }
-            }
-        }
-        
-        // Even if we didn't get valid deltas, we should complete the transcription
-        Task { @MainActor in
-            await self.onTranscriptionComplete?()
-        }
-    }
-    
-    // Process a single SSE event - returns true if a valid delta was processed
-    private func processSSEEvent(_ jsonText: String) -> Bool {
-        // Skip empty messages and special non-JSON messages
-        if jsonText.isEmpty || jsonText == "[DONE]" {
-            log(.debug, message: "Received end-of-stream marker")
-            return false
-        }
-        
-        guard let jsonData = jsonText.data(using: .utf8) else { 
-            log(.debug, message: "Could not convert SSE text to data")
-            return false
-        }
-        
-        do {
-            if let json = try JSONSerialization.jsonObject(with: jsonData) as? [String: Any],
-               let type = json["type"] as? String {
-                
-                switch type {
-                case "transcript.text.delta":
-                    if let delta = json["delta"] as? String {
-                        log(.debug, message: "Transcription delta: \"\(delta)\"")
+            case .done(let fullText):
+                if let fullText = fullText {
+                    log(.info, message: "Transcription complete: \"\(fullText)\"")
+                    if !didReceiveText {
+                        didReceiveText = true
                         Task { @MainActor in
-                            await self.onTranscriptionReceived?(delta)
+                            await self.onTranscriptionReceived?(fullText)
                         }
-                        return true
                     }
-                    
-                case "transcript.text.done":
-                    if let fullText = json["text"] as? String {
-                        log(.info, message: "Transcription complete: \"\(fullText)\"")
+                } else {
+                    log(.debug, message: "Received end-of-stream marker")
+                }
+                if !didComplete {
+                    didComplete = true
+                    Task { @MainActor in
+                        await self.onTranscriptionComplete?()
                     }
-                    return true
-                    
-                default:
-                    log(.debug, message: "Unhandled SSE event type: \(type)")
                 }
             }
-        } catch {
-            // Don't treat as an error - this could be a non-JSON message or stream terminator
-            log(.debug, message: "Skipping non-JSON SSE message: \(error.localizedDescription)")
         }
-        
-        return false
     }
     
     // Parse error message from response data
@@ -439,10 +379,34 @@ actor TranscriptionService {
         
         return errorStr
     }
+
+    private func parseTranscriptionText(data: Data) -> String? {
+        do {
+            if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let text = json["text"] as? String {
+                return text
+            }
+        } catch {
+            return nil
+        }
+        
+        return nil
+    }
+
+    private func collectBytes(_ bytes: URLSession.AsyncBytes) async throws -> Data {
+        var data = Data()
+        for try await byte in bytes {
+            data.append(byte)
+        }
+        return data
+    }
     
     func cancelTranscription() {
         transcriptionTask?.cancel()
         transcriptionTask = nil
+        sseParser = SSEStreamParser()
+        didComplete = false
+        didReceiveText = false
         // Ensure we switch back to idle state
         connectionState = .idle
         
@@ -485,4 +449,3 @@ actor TranscriptionService {
         self.onTranscriptionComplete = onComplete
     }
 } 
-

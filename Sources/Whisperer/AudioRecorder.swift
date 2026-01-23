@@ -2,8 +2,8 @@ import Foundation
 import AVFoundation
 import CoreAudio
 
-@MainActor
 class AudioRecorder: NSObject {
+    private let recordingLock = NSLock()
     private var audioEngine: AVAudioEngine!
     private var inputNode: AVAudioInputNode!
     private var audioBuffers: [AVAudioPCMBuffer] = []
@@ -34,35 +34,19 @@ class AudioRecorder: NSObject {
     }
     
     deinit {
-        // For deinit, we need to handle this in a way that doesn't capture self
-        // Create local snapshot of variables needed
-        let localIsRecording = isRecording
+        recordingLock.lock()
         let localInputNode = inputNode
         let localAudioEngine = audioEngine
+        let localIsRecording = isRecording
+        recordingLock.unlock()
         
-        // Capture the observer to unregister later
-        let localSelf = self
-        
-        // Schedule cleanup on the main actor without capturing self
         if localIsRecording {
-            Task.detached { @MainActor in
-                // Stop the engine without using instance methods
-                localAudioEngine?.stop()
-                localInputNode?.removeTap(onBus: 0)
-                
-                // Unregister from device notifications
-                localSelf.unregisterFromDeviceNotifications()
-            }
-        } else {
-            // If not recording, we can do simple cleanup
-            localInputNode?.removeTap(onBus: 0)
             localAudioEngine?.stop()
-            
-            // Unregister in a detached task
-            Task.detached { @MainActor in
-                localSelf.unregisterFromDeviceNotifications()
-            }
         }
+        
+        localInputNode?.removeTap(onBus: 0)
+        localAudioEngine?.stop()
+        unregisterFromDeviceNotifications()
     }
     
     // MARK: - Device Notification Handling
@@ -125,7 +109,11 @@ class AudioRecorder: NSObject {
         log("Audio devices changed")
         
         // If we're currently recording, check if our selected device is still available
-        if isRecording, let selectedID = selectedInputDeviceID {
+        recordingLock.lock()
+        let currentlyRecording = isRecording
+        recordingLock.unlock()
+        
+        if currentlyRecording, let selectedID = selectedInputDeviceID {
             refreshDeviceList()
             
             // Check if our device is still in the list
@@ -189,14 +177,20 @@ class AudioRecorder: NSObject {
         // Install tap on input node with the potentially updated format
         log("Installing tap on input node (bus 0, buffer size \(bufferSize))")
         inputNode.installTap(onBus: 0, bufferSize: bufferSize, format: inputFormat) { [weak self] (buffer, time) in
-            guard let self = self, self.isRecording else { return }
+            guard let self = self else { return }
+            self.recordingLock.lock()
+            let shouldRecord = self.isRecording
+            self.recordingLock.unlock()
+            guard shouldRecord else { return }
             
             // Log when a buffer is received
             // self.log("Received audio buffer at time: \(time)") // Keep this commented unless debugging buffer flow
             
             // Convert to the format we need (16kHz, 16-bit, mono) for the transcription service
             if let convertedBuffer = self.convertBufferToFormat(buffer) {
+                self.recordingLock.lock()
                 self.audioBuffers.append(convertedBuffer)
+                self.recordingLock.unlock()
             }
         }
         log("Tap installed successfully on input node.")
@@ -204,10 +198,10 @@ class AudioRecorder: NSObject {
     
     // Restart the audio engine to adapt to device changes
     private func restartAudioEngine() {
-        guard isRecording else { return }
-        
-        // Remember we were recording
+        recordingLock.lock()
         let wasRecording = isRecording
+        recordingLock.unlock()
+        guard wasRecording else { return }
         
         log("Restarting audio engine due to device change...")
         // Stop existing setup
@@ -227,7 +221,9 @@ class AudioRecorder: NSObject {
                 log("Restarted audio engine started successfully.")
             } catch {
                 log("Failed to restart audio engine: \(error.localizedDescription). Error details: \(error)")
+                recordingLock.lock()
                 isRecording = false // Update state
+                recordingLock.unlock()
                 // Ensure this error propagates
                 onRecordingError?("Audio device changed and couldn't reconnect: \(error.localizedDescription)")
             }
@@ -318,8 +314,12 @@ class AudioRecorder: NSObject {
         }
         
         // Get the stream configuration
-        let bufferList = UnsafeMutablePointer<AudioBufferList>.allocate(capacity: Int(propSize))
-        defer { bufferList.deallocate() }
+        let rawPointer = UnsafeMutableRawPointer.allocate(
+            byteCount: Int(propSize),
+            alignment: MemoryLayout<AudioBufferList>.alignment
+        )
+        defer { rawPointer.deallocate() }
+        let bufferList = rawPointer.bindMemory(to: AudioBufferList.self, capacity: 1)
         
         status = AudioObjectGetPropertyData(
             deviceID,
@@ -444,7 +444,9 @@ class AudioRecorder: NSObject {
         }
         
         // Store the current recording state BEFORE changing the device
+        recordingLock.lock()
         let wasRecording = isRecording
+        recordingLock.unlock()
         
         // Set as selected device
         selectedInputDeviceID = audioDeviceID
@@ -475,7 +477,9 @@ class AudioRecorder: NSObject {
         audioEngine = nil
         inputNode = nil
         // We are no longer recording after teardown
-        isRecording = false 
+        recordingLock.lock()
+        isRecording = false
+        recordingLock.unlock()
         
         // --- Setup new engine with the new device --- 
         log("Calling setupAudioEngine to apply new device setting.")
@@ -494,12 +498,16 @@ class AudioRecorder: NSObject {
              log("Attempting to restart recording after device change...")
              do {
                  try audioEngine.start()
+                 recordingLock.lock()
                  isRecording = true // Mark as recording again *only on success*
+                 recordingLock.unlock()
                  log("Successfully restarted recording after device change.")
                  startSilenceWatchdog() // Restart watchdog for the new recording session
              } catch {
                  log("Failed to start audio engine after device change: \(error.localizedDescription)")
+                 recordingLock.lock()
                  isRecording = false // Ensure state is correct
+                 recordingLock.unlock()
                  onRecordingError?("Failed to restart recording after device change: \(error.localizedDescription)")
              }
         } else {
@@ -565,58 +573,74 @@ class AudioRecorder: NSObject {
     }
     
     func startRecording() {
-        guard !isRecording else { return }
+        recordingLock.lock()
+        if isRecording {
+            recordingLock.unlock()
+            return
+        }
         
         // Clear previous buffers
         audioBuffers.removeAll()
+        isRecording = true
+        recordingLock.unlock()
         
         do {
             // Start audio engine
             try audioEngine.start()
-            isRecording = true
             log("Audio recording started")
             
             // Set up a watchdog to detect if we're not getting any audio
             startSilenceWatchdog()
         } catch {
             log("Failed to start audio recording: \(error.localizedDescription)")
+            recordingLock.lock()
+            isRecording = false
+            recordingLock.unlock()
             onRecordingError?("Failed to start recording: \(error.localizedDescription)")
         }
     }
     
     // Monitor for audio data to ensure we're actually recording
     private func startSilenceWatchdog() {
-        // Capture the initial buffer count
+        recordingLock.lock()
         let initialBufferCount = audioBuffers.count
+        recordingLock.unlock()
         
-        // Check after 2 seconds if we've received any audio
-        Task { @MainActor in
-            try? await Task.sleep(nanoseconds: 2_000_000_000)
+        DispatchQueue.global().asyncAfter(deadline: .now() + 2) { [weak self] in
+            guard let self = self else { return }
+            self.recordingLock.lock()
+            let stillRecording = self.isRecording
+            let currentCount = self.audioBuffers.count
+            self.recordingLock.unlock()
             
-            // If we're still recording but received no audio data, report an error
-            if isRecording && audioBuffers.count == initialBufferCount {
-                log("No audio data received after 2 seconds - possible device issue")
-                onRecordingError?("No audio detected. Microphone may be muted or unavailable.")
+            if stillRecording && currentCount == initialBufferCount {
+                self.log("No audio data received after 2 seconds - possible device issue")
+                self.onRecordingError?("No audio detected. Microphone may be muted or unavailable.")
             }
         }
     }
     
-    // Regular MainActor method since we want to call it from the main actor context
     func stopRecording() {
         // Log the state when stopRecording is called
-        log("stopRecording called. isRecording: \(isRecording), buffer count: \(audioBuffers.count)")
+        recordingLock.lock()
+        let wasRecording = isRecording
+        let bufferedCount = audioBuffers.count
+        isRecording = false
+        let buffers = audioBuffers
+        audioBuffers.removeAll()
+        recordingLock.unlock()
         
-        guard isRecording else { return }
+        log("stopRecording called. isRecording: \(wasRecording), buffer count: \(bufferedCount)")
+        
+        guard wasRecording else { return }
         
         audioEngine.stop()
         inputNode.removeTap(onBus: 0)
         
-        isRecording = false
-        
         log("Audio recording stopped")
         
         // Get the audio data and call the completion handler
-        if let audioData = getAudioData() {
+        if let audioData = getAudioData(from: buffers) {
             if audioData.count < 100 {
                 log("Audio data too small to process")
                 onRecordingError?("Recording was too quiet or microphone may be muted")
@@ -633,8 +657,8 @@ class AudioRecorder: NSObject {
     }
     
     // Convert the current audio buffer to 16-bit PCM data
-    private func getAudioData() -> Data? {
-        guard !audioBuffers.isEmpty else { return nil }
+    private func getAudioData(from buffers: [AVAudioPCMBuffer]) -> Data? {
+        guard !buffers.isEmpty else { return nil }
         
         // Combine all audio buffers into one data object
         var combinedData = Data()
@@ -644,7 +668,7 @@ class AudioRecorder: NSObject {
             combinedData.append(silencePadding)
         }
         
-        for buffer in audioBuffers {
+        for buffer in buffers {
             guard let audioBuffer = buffer.int16ChannelData?[0] else { continue }
             
             let frameLength = Int(buffer.frameLength)
@@ -675,17 +699,17 @@ class AudioRecorder: NSObject {
     // Cancel recording without triggering the completion callback
     // Used for very short recordings we want to discard
     func cancelRecording() {
-        guard isRecording else { return }
+        recordingLock.lock()
+        let wasRecording = isRecording
+        isRecording = false
+        audioBuffers.removeAll()
+        recordingLock.unlock()
+        
+        guard wasRecording else { return }
         
         audioEngine.stop()
         inputNode.removeTap(onBus: 0)
-        
-        isRecording = false
-        
         log("Audio recording canceled (too short)")
-        
-        // Clear buffers
-        audioBuffers.removeAll()
         
         // Reinstall tap for next recording
         setupAudioEngine()

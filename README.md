@@ -49,11 +49,16 @@ A Mac-native productivity app that types what you say into into the active text 
 ## Troubleshooting
 
 - If text isn't appearing, make sure you've granted Accessibility permissions
+- If you're running from Terminal or an IDE, grant Accessibility permissions to that host app
 - If the app isn't responding to the right Option key, try restarting the app
-- Test the OpenAI API key to make sure it's valid
+- If you don't see any transcription, check microphone permissions in System Settings
+- Check the OpenAI API key in settings if transcription isn't working
+- Use the "Test" button in Settings to verify your API key is valid
+- Make sure your internet connection is stable for WebSocket communication
+- If audio recording fails, try selecting a different input device from the menu
 - If the output is nonsense, it might not be hearing you - check your input devices
-- Make sure your internet connection is stable
 - Consider using a more specific custom prompt for better transcription of domain-specific terms 
+- `swift test` requires the full Xcode toolchain (Command Line Tools alone may not include XCTest)
 
 
 ## Prompting
