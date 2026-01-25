@@ -319,10 +319,10 @@ struct TranscriptionHistorySection: View {
     }
     
     private func previewText(_ text: String) -> String {
-        if text.count <= 30 {
+        if text.count <= 45 {
             return text
         } else {
-            let index = text.index(text.startIndex, offsetBy: 30)
+            let index = text.index(text.startIndex, offsetBy: 42)
             return String(text[..<index]) + "..."
         }
     }
