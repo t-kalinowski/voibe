@@ -332,14 +332,14 @@ actor TranscriptionService {
         for event in events {
             switch event {
             case .delta(let delta):
-                log(.debug, message: "Transcription delta: \"\(delta)\"")
+                log(.debug, message: "Transcription delta received (\(textSummary(delta)))")
                 didReceiveText = true
                 Task { @MainActor in
                     await self.onTranscriptionReceived?(delta)
                 }
             case .done(let fullText):
                 if let fullText = fullText {
-                    log(.info, message: "Transcription complete: \"\(fullText)\"")
+                    log(.info, message: "Transcription complete (\(textSummary(fullText)))")
                     if !didReceiveText {
                         didReceiveText = true
                         Task { @MainActor in
@@ -424,18 +424,20 @@ actor TranscriptionService {
         formatter.dateFormat = "yyyy-MM-dd HH:mm:ss.SSS"
         let timestamp = formatter.string(from: now)
         
-        if level.rawValue <= logLevel.rawValue {
-            let prefix: String
-            switch level {
-            case .none: prefix = ""
-            case .error: prefix = "❌ ERROR: "
-            case .info: prefix = "ℹ️ INFO: "
-            case .debug: prefix = "🔍 DEBUG: "
-            }
-            print("\(timestamp) \(prefix)\(message)")
-        } else {
-            print("\(timestamp) \(message)")
+        guard level.rawValue <= logLevel.rawValue else { return }
+        let prefix: String
+        switch level {
+        case .none: prefix = ""
+        case .error: prefix = "❌ ERROR: "
+        case .info: prefix = "ℹ️ INFO: "
+        case .debug: prefix = "🔍 DEBUG: "
         }
+        print("\(timestamp) \(prefix)\(message)")
+    }
+
+    private func textSummary(_ text: String) -> String {
+        let wordCount = text.split(whereSeparator: { $0.isWhitespace || $0.isNewline }).count
+        return "words: \(wordCount), chars: \(text.count)"
     }
     
     /// Set all callbacks safely within the actor's isolation domain

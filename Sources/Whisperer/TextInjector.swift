@@ -8,6 +8,7 @@ class TextInjector {
     private var previousText = ""
     // For logging
     private let logEnabled = true
+    private let minLogCharacters = 20
     
     func injectText(_ text: String) {
         injectionQueue.async { [weak self] in
@@ -21,12 +22,13 @@ class TextInjector {
         previousText = result.newPreviousText
         
         // Do nothing if there's no new text
-        guard !newText.isEmpty else { 
-            log("No new text to inject")
-            return 
+        guard !newText.isEmpty else {
+            return
         }
         
-        log("Injecting text: \"\(newText)\"")
+        if newText.count >= minLogCharacters {
+            log("Injecting text (\(textSummary(newText)))")
+        }
         
         // Inject the text using CGEvent.keyboardSetUnicodeString
         injectUnicodeString(newText)
@@ -100,5 +102,10 @@ class TextInjector {
             let time = formatter.string(from: Date())
             print("[TextInjector] [\(time)] \(message)")
         }
+    }
+
+    private func textSummary(_ text: String) -> String {
+        let wordCount = text.split(whereSeparator: { $0.isWhitespace || $0.isNewline }).count
+        return "words: \(wordCount), chars: \(text.count)"
     }
 } 
