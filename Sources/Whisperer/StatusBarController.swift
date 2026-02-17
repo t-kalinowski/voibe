@@ -128,7 +128,10 @@ class StatusBarController: ObservableObject {
         }
         
         // Start monitoring keys
-        keyMonitor.start()
+        if !keyMonitor.start() {
+            errorMessage = "Global hotkey unavailable. Grant Accessibility (and Input Monitoring if required), then restart Voibe."
+            connectionState = "Error"
+        }
     }
     
     private func setupAudioRecorder() {

@@ -29,7 +29,7 @@ class KeyMonitor {
         }
     }
     
-    func start() {
+    func start() -> Bool {
         let eventMask = (1 << CGEventType.flagsChanged.rawValue)
         
         // For C callbacks we can't use a closure that captures context directly
@@ -38,13 +38,14 @@ class KeyMonitor {
         guard let eventTap = CGEvent.tapCreate(
             tap: .cgSessionEventTap,
             place: .headInsertEventTap,
-            options: .defaultTap,
+            // Listen-only is sufficient for hotkey detection and is less fragile.
+            options: .listenOnly,
             eventsOfInterest: CGEventMask(eventMask),
             callback: eventTapCallback,
             userInfo: Unmanaged.passUnretained(self).toOpaque()
         ) else {
             log("Failed to create event tap")
-            return
+            return false
         }
         
         self.eventTap = eventTap
@@ -54,7 +55,13 @@ class KeyMonitor {
             CFRunLoopAddSource(CFRunLoopGetCurrent(), runLoopSource, .commonModes)
             CGEvent.tapEnable(tap: eventTap, enable: true)
             log("Key monitor started")
+            return true
         }
+        
+        CGEvent.tapEnable(tap: eventTap, enable: false)
+        self.eventTap = nil
+        log("Failed to create event tap run loop source")
+        return false
     }
     
     // Keep this as a regular MainActor method since we call it from the main actor
@@ -97,7 +104,7 @@ class KeyMonitor {
 // Static callback function for the event tap - must NOT be actor-isolated
 private func eventTapCallback(proxy: CGEventTapProxy, type: CGEventType, event: CGEvent, userInfo: UnsafeMutableRawPointer?) -> Unmanaged<CGEvent>? {
     guard let userInfo = userInfo else {
-        return Unmanaged.passRetained(event)
+        return Unmanaged.passUnretained(event)
     }
     
     // Get the KeyMonitor instance from userInfo
@@ -112,5 +119,5 @@ private func eventTapCallback(proxy: CGEventTapProxy, type: CGEventType, event: 
         keyMonitor.handleKeyEvent(isPressed: isOptionPressed, keyCode: keyCode)
     }
     
-    return Unmanaged.passRetained(event)
+    return Unmanaged.passUnretained(event)
 }

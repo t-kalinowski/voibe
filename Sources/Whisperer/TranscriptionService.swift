@@ -52,9 +52,6 @@ actor TranscriptionService {
     
     private var recordedAudioData: Data?
     private var transcriptionTask: Task<Void, Never>?
-    private var sseParser = SSEStreamParser()
-    private var didComplete = false
-    private var didReceiveText = false
     
     // Callbacks
     private var onTranscriptionReceived: ((String) -> Void)?
@@ -142,6 +139,7 @@ actor TranscriptionService {
         request.httpMethod = "POST"
         request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
         request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
         
         // Create the request body
         request.httpBody = createRequestBody(boundary: boundary, audioData: audioData)
@@ -149,20 +147,17 @@ actor TranscriptionService {
         // Cancel any existing task
         transcriptionTask?.cancel()
         transcriptionTask = nil
-        sseParser = SSEStreamParser()
-        didComplete = false
-        didReceiveText = false
         
         log(.info, message: "Sending audio for transcription...")
         
         transcriptionTask = Task { [weak self] in
-            await self?.streamTranscription(request: request)
+            await self?.requestTranscription(request: request)
         }
     }
     
-    private func streamTranscription(request: URLRequest) async {
+    private func requestTranscription(request: URLRequest) async {
         do {
-            let (bytes, response) = try await URLSession.shared.bytes(for: request)
+            let (responseData, response) = try await URLSession.shared.data(for: request)
             
             guard let httpResponse = response as? HTTPURLResponse else {
                 connectionState = .error("Invalid response from server")
@@ -170,8 +165,7 @@ actor TranscriptionService {
             }
             
             if httpResponse.statusCode != 200 {
-                let errorData = try await collectBytes(bytes)
-                let errorMessage = parseErrorMessage(data: errorData)
+                let errorMessage = parseErrorMessage(data: responseData)
                 log(.error, message: "Server returned error: \(httpResponse.statusCode), \(errorMessage)")
                 
                 // Check if this is a server error (5xx) that should be retried
@@ -184,49 +178,30 @@ actor TranscriptionService {
                 return
             }
             
-            var chunk = Data()
-            var responseData = Data()
-            for try await byte in bytes {
-                if Task.isCancelled {
-                    connectionState = .error("Request cancelled")
-                    return
-                }
-                
-                chunk.append(byte)
-                responseData.append(byte)
-                if chunk.count >= 1024 {
-                    handleSSEChunk(&chunk)
-                }
-            }
-            
-            if !chunk.isEmpty {
-                handleSSEChunk(&chunk)
-            }
-            
-            let trailingEvents = sseParser.flush()
-            if !trailingEvents.isEmpty {
-                handleSSEEvents(trailingEvents)
-            }
-
             // Reset retry count on success
             currentRetryCount = 0
             
-            if !didReceiveText, let showingText = parseTranscriptionText(data: responseData) {
-                didReceiveText = true
-                Task { @MainActor in
-                    await self.onTranscriptionReceived?(showingText)
+            if let showingText = parseTranscriptionText(data: responseData), !showingText.isEmpty {
+                log(.info, message: "Transcription complete (\(textSummary(showingText)))")
+                let onReceived = self.onTranscriptionReceived
+                let onComplete = self.onTranscriptionComplete
+                await MainActor.run {
+                    onReceived?(showingText)
+                    onComplete?()
+                }
+            } else {
+                log(.info, message: "Transcription complete with empty text")
+                if let raw = String(data: responseData, encoding: .utf8) {
+                    let preview = String(raw.prefix(240))
+                    log(.error, message: "Could not parse transcription text. Response preview: \(preview)")
+                }
+                let onComplete = self.onTranscriptionComplete
+                await MainActor.run {
+                    onComplete?()
                 }
             }
             
-            log(.info, message: "Transcription complete")
             connectionState = .idle
-            
-            if !didComplete {
-                didComplete = true
-                Task { @MainActor in
-                    await self.onTranscriptionComplete?()
-                }
-            }
         } catch {
             if Task.isCancelled {
                 connectionState = .error("Request cancelled")
@@ -296,10 +271,10 @@ actor TranscriptionService {
         body.append("Content-Disposition: form-data; name=\"language\"\r\n\r\n".data(using: .utf8)!)
         body.append("en\r\n".data(using: .utf8)!)
         
-        // Add stream parameter for SSE
+        // Explicitly request JSON so we can parse one complete non-stream response.
         body.append("--\(boundary)\r\n".data(using: .utf8)!)
-        body.append("Content-Disposition: form-data; name=\"stream\"\r\n\r\n".data(using: .utf8)!)
-        body.append("true\r\n".data(using: .utf8)!)
+        body.append("Content-Disposition: form-data; name=\"response_format\"\r\n\r\n".data(using: .utf8)!)
+        body.append("json\r\n".data(using: .utf8)!)
         
         // Create WAV file with PCM audio data
         let wavData = createWavFileFromPCMData(audioData)
@@ -320,43 +295,6 @@ actor TranscriptionService {
     // Function to create a WAV file from the PCM audio data
     private func createWavFileFromPCMData(_ pcmData: Data) -> Data {
         WavEncoder.encodePCM(pcmData)
-    }
-    
-    private func handleSSEChunk(_ chunk: inout Data) {
-        let events = sseParser.feed(chunk)
-        chunk.removeAll(keepingCapacity: true)
-        handleSSEEvents(events)
-    }
-    
-    private func handleSSEEvents(_ events: [SSEEvent]) {
-        for event in events {
-            switch event {
-            case .delta(let delta):
-                log(.debug, message: "Transcription delta received (\(textSummary(delta)))")
-                didReceiveText = true
-                Task { @MainActor in
-                    await self.onTranscriptionReceived?(delta)
-                }
-            case .done(let fullText):
-                if let fullText = fullText {
-                    log(.info, message: "Transcription complete (\(textSummary(fullText)))")
-                    if !didReceiveText {
-                        didReceiveText = true
-                        Task { @MainActor in
-                            await self.onTranscriptionReceived?(fullText)
-                        }
-                    }
-                } else {
-                    log(.debug, message: "Received end-of-stream marker")
-                }
-                if !didComplete {
-                    didComplete = true
-                    Task { @MainActor in
-                        await self.onTranscriptionComplete?()
-                    }
-                }
-            }
-        }
     }
     
     // Parse error message from response data
@@ -381,32 +319,27 @@ actor TranscriptionService {
     }
 
     private func parseTranscriptionText(data: Data) -> String? {
+        // Preferred path: parse JSON response body with "text".
         do {
             if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
                let text = json["text"] as? String {
                 return text
             }
         } catch {
-            return nil
+            // Fall through to plain-text fallback.
+        }
+        
+        // Fallback: if API returns plain text, use it directly.
+        if let text = String(data: data, encoding: .utf8) {
+            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed.isEmpty ? nil : trimmed
         }
         
         return nil
     }
-
-    private func collectBytes(_ bytes: URLSession.AsyncBytes) async throws -> Data {
-        var data = Data()
-        for try await byte in bytes {
-            data.append(byte)
-        }
-        return data
-    }
-    
     func cancelTranscription() {
         transcriptionTask?.cancel()
         transcriptionTask = nil
-        sseParser = SSEStreamParser()
-        didComplete = false
-        didReceiveText = false
         // Ensure we switch back to idle state
         connectionState = .idle
         

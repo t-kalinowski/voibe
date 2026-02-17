@@ -353,7 +353,7 @@ struct SettingsSection: View {
             // Conditionally show Accessibility settings section at the top
             if !accessibilityGranted {
                 VStack(spacing: 6) {
-                    Text("Accessibility permission is required for key monitoring")
+                    Text("Accessibility permission is required for key monitoring (and Input Monitoring may also be required on some macOS versions)")
                         .font(.caption)
                         .foregroundColor(.secondary)
                         .multilineTextAlignment(.center)

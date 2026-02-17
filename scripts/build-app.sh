@@ -6,21 +6,23 @@ set -euo pipefail
 # Usage:
 #   scripts/build-app.sh
 #   OPEN_AFTER_BUILD=0 scripts/build-app.sh
-#   BUNDLE_ID=com.example.voibe CODESIGN_IDENTITY="Developer ID Application: ..." scripts/build-app.sh
+#   VOIBE_BUNDLE_ID=com.example.voibe CODESIGN_IDENTITY="Developer ID Application: ..." scripts/build-app.sh
 
 SCRIPT_DIR="${0:A:h}"
 REPO_ROOT="${SCRIPT_DIR:h}"
 cd "$REPO_ROOT"
 
-APP_NAME="${APP_NAME:-Voibe}"
-EXECUTABLE_NAME="${EXECUTABLE_NAME:-Voibe}"
-BUNDLE_ID="${BUNDLE_ID:-com.corlinp.voibe}"
+# Keep app identity stable across builds so macOS permissions can persist.
+# Use VOIBE_* overrides to avoid accidental collision with generic env vars.
+APP_NAME="${VOIBE_APP_NAME:-Voibe}"
+EXECUTABLE_NAME="${VOIBE_EXECUTABLE_NAME:-Voibe}"
+BUNDLE_ID="${VOIBE_BUNDLE_ID:-com.corlinp.voibe}"
 APP_VERSION="${APP_VERSION:-1.0}"
 BUILD_NUMBER="${BUILD_NUMBER:-1}"
 MIN_MACOS="${MIN_MACOS:-13.0}"
-DIST_DIR="${DIST_DIR:-dist}"
+DIST_DIR="${VOIBE_DIST_DIR:-dist}"
 APP_PATH="${DIST_DIR}/${APP_NAME}.app"
-CODESIGN_IDENTITY="${CODESIGN_IDENTITY:--}" # "-" = ad-hoc
+CODESIGN_IDENTITY="${CODESIGN_IDENTITY:-}"
 OPEN_AFTER_BUILD="${OPEN_AFTER_BUILD:-1}"
 GENERATE_ICON="${GENERATE_ICON:-1}"
 ICON_WORKDIR="${DIST_DIR}/icon-assets"
@@ -74,8 +76,12 @@ cat > "$APP_PATH/Contents/Info.plist" <<EOF
 </plist>
 EOF
 
-echo "Signing app (identity: ${CODESIGN_IDENTITY})..."
-codesign --force --deep --sign "$CODESIGN_IDENTITY" "$APP_PATH"
+if [[ -n "$CODESIGN_IDENTITY" ]]; then
+  echo "Signing app (identity: ${CODESIGN_IDENTITY})..."
+  codesign --force --deep --sign "$CODESIGN_IDENTITY" "$APP_PATH"
+else
+  echo "Skipping codesign (set CODESIGN_IDENTITY to sign explicitly)."
+fi
 
 echo "Built: ${APP_PATH}"
 echo "Next: launch it from Finder or run: open \"$APP_PATH\""
