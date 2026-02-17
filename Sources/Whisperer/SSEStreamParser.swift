@@ -40,25 +40,41 @@ struct SSEStreamParser {
     }
 
     private func parseEventBlock(_ block: String) -> [SSEEvent] {
-        var events: [SSEEvent] = []
         let lines = block.components(separatedBy: "\n")
+        var declaredEventType: String? = nil
+        var dataLines: [String] = []
 
         for line in lines {
-            let trimmedLine = line.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard trimmedLine.hasPrefix("data:") else { continue }
-            var payload = String(trimmedLine.dropFirst("data:".count))
-            if payload.hasPrefix(" ") {
-                payload.removeFirst()
+            if line.hasPrefix("event:") {
+                var eventType = String(line.dropFirst("event:".count))
+                if eventType.hasPrefix(" ") {
+                    eventType.removeFirst()
+                }
+                declaredEventType = eventType.trimmingCharacters(in: .whitespacesAndNewlines)
+                continue
             }
-            if let event = parsePayload(payload) {
-                events.append(event)
+
+            if line.hasPrefix("data:") {
+                var payloadLine = String(line.dropFirst("data:".count))
+                if payloadLine.hasPrefix(" ") {
+                    payloadLine.removeFirst()
+                }
+                dataLines.append(payloadLine)
             }
         }
 
-        return events
+        guard !dataLines.isEmpty else {
+            return []
+        }
+
+        let payload = dataLines.joined(separator: "\n")
+        if let event = parsePayload(payload, declaredEventType: declaredEventType) {
+            return [event]
+        }
+        return []
     }
 
-    private func parsePayload(_ payload: String) -> SSEEvent? {
+    private func parsePayload(_ payload: String, declaredEventType: String?) -> SSEEvent? {
         if payload.isEmpty || payload == "[DONE]" {
             return payload == "[DONE]" ? .done(nil) : nil
         }
@@ -68,15 +84,25 @@ struct SSEStreamParser {
         }
 
         do {
-            if let json = try JSONSerialization.jsonObject(with: jsonData) as? [String: Any],
-               let type = json["type"] as? String {
-                switch type {
-                case "transcript.text.delta":
+            if let json = try JSONSerialization.jsonObject(with: jsonData) as? [String: Any] {
+                let eventType = (json["type"] as? String) ?? declaredEventType
+                guard let eventType = eventType else {
+                    return nil
+                }
+
+                switch eventType {
+                case "transcript.text.delta", "response.output_text.delta":
                     if let delta = json["delta"] as? String {
                         return .delta(delta)
                     }
-                case "transcript.text.done":
-                    return .done(json["text"] as? String)
+                case "transcript.text.done", "response.output_text.done":
+                    if let text = json["text"] as? String {
+                        return .done(text)
+                    }
+                    if let text = json["delta"] as? String {
+                        return .done(text)
+                    }
+                    return .done(nil)
                 default:
                     return nil
                 }

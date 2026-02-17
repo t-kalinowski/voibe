@@ -28,6 +28,32 @@ final class SSEStreamParserTests: XCTestCase {
         XCTAssertEqual(events, [.delta("hi"), .delta(" there"), .done("hi there")])
     }
 
+    func testParsesEventFieldWithDeltaPayload() {
+        var parser = SSEStreamParser()
+        let data = """
+        event: transcript.text.delta
+        data: {"delta":"hello"}
+
+        """.data(using: .utf8)!
+
+        let events = parser.feed(data)
+
+        XCTAssertEqual(events, [.delta("hello")])
+    }
+
+    func testParsesEventFieldWithDonePayload() {
+        var parser = SSEStreamParser()
+        let data = """
+        event: transcript.text.done
+        data: {"text":"hello world"}
+
+        """.data(using: .utf8)!
+
+        let events = parser.feed(data)
+
+        XCTAssertEqual(events, [.done("hello world")])
+    }
+
     func testParsesDoneSentinel() {
         var parser = SSEStreamParser()
         let data = "data: [DONE]\n\n".data(using: .utf8)!
